@@ -19,7 +19,7 @@
 #include "game.h"  
 
 #define BACKLOG 5
-#define MAP_FILE "resources/map.txt"
+#define MAP_FILE "resources/map1.txt"
 
 typedef struct {
     int count;
@@ -29,9 +29,9 @@ typedef struct {
 } SharedData;
 
 typedef struct {
-    int broadcast_pipe[2];  
-    SharedData* shared;     // Référence vers la mémoire partagée
-} BroadcastData;
+    int pipe_read;
+    SharedData* shared;
+} BroadcastThreadData;
 
 volatile sig_atomic_t stop_requested = 0;
 
@@ -42,18 +42,66 @@ int initSocketServer(int serverPort) {
     return socketfd;
 }
 
+const char* item_to_string(enum Item item) {
+    switch (item) {
+        case WALL:      return "WALL";
+        case FLOOR:     return "FLOOR";
+        case FOOD:      return "FOOD";
+        case SUPERFOOD: return "SUPERFOOD";
+        case PLAYER1:   return "PLAYER1";
+        case PLAYER2:   return "PLAYER2";
+        default:        return "UNKNOWN";
+    }
+}
+
+
+
 void* broadcast_handler(void* arg) {
-    int pipe_read = *(int*)arg;
+    BroadcastThreadData* data = (BroadcastThreadData*)arg;
     char buffer[1024];
     
+    printf("[BROADCAST] Thread démarré (pipe_read=%d)\n", data->pipe_read);
+    
     while (1) {
-        ssize_t n = read(pipe_read, buffer, sizeof(buffer));
-        if (n <= 0) break;
-        
-        // Envoie à tous les clients
-        for (int i = 0; i < shared->count; i++) {
-            nwrite(shared->fds[i], buffer, n);
+        ssize_t n = read(data->pipe_read, buffer, sizeof(buffer));
+        if (n <= 0) {
+            printf("[BROADCAST] Fin du pipe (n=%zd)\n", n);
+            break;
         }
+        
+        printf("[BROADCAST] Reçu %zd bytes: type=%d\n", n, ((union Message*)buffer)->msgt);
+        
+        sem_down0(data->shared->sem);
+        // Dans broadcast_handler
+        printf("[BROADCAST] Envoi à %d clients\n", data->shared->count);
+        for (int i = 0; i < data->shared->count; i++) {
+            if (data->shared->fds[i] > 0) {
+                printf("Envoi au client %d (fd=%d)\n", i, data->shared->fds[i]);
+                union Message* m = (union Message*)buffer;
+                printf("Message type: %d\n", m->msgt);
+                nwrite(data->shared->fds[i], buffer, n);
+            }
+        }
+        
+        StructMessage* m = (StructMessage*) buffer;
+
+        if (m->code == GAME_START) {
+            printf("[BROADCAST] Envoi MAP_DATA aux clients\n");
+            // Send the actual map data
+            StructMessage map_msg;
+            map_msg.code = MAP_DATA;
+            const char *map_str = item_to_string(data->shared->game_state.map[0]);  // Par exemple pour un élément spécifique
+            strncpy(map_msg.messageText, map_str, sizeof(map_msg.messageText));
+            
+            for (int i = 0; i < data->shared->count; i++) {
+                if (data->shared->fds[i] > 0) {
+                    nwrite(data->shared->fds[i], &map_msg, sizeof(StructMessage));
+                }
+            }
+        }
+        printf("[BROADCAST] Message details: code=%d, text='%.10s...'\n", 
+            m->code, m->messageText);
+        sem_up0(data->shared->sem);
     }
     return NULL;
 }
@@ -85,9 +133,15 @@ void client_handler(int client_fd, SharedData* shared) {
         sleep(1);
     }
 
-    // 3. NOTIFICATION DEBUT PARTIE
+    // 3. NOTIFICATION DEBUT PARTIE + MAP
     msg.code = GAME_START;
     snprintf(msg.messageText, sizeof(msg.messageText), "%d", player_id);
+    nwrite(client_fd, &msg, sizeof(msg));
+
+    // Send map data
+    msg.code = MAP_DATA;
+    const char *map_str = item_to_string(shared->game_state.map[0]);  // Par exemple pour un élément spécifique
+    strncpy(msg.messageText, map_str, sizeof(msg.messageText));
     nwrite(client_fd, &msg, sizeof(msg));
 
     // 4. BOUCLE DE COMMUNICATION
@@ -104,6 +158,17 @@ void client_handler(int client_fd, SharedData* shared) {
             sem_up0(shared->sem);
         }
     }
+
+    // Avant sclose(client_fd);
+    sem_down0(shared->sem);
+    // Marquer le fd comme invalide
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (shared->fds[i] == client_fd) {
+            shared->fds[i] = -1;
+            break;
+        }
+    }
+    sem_up0(shared->sem);
 
     sclose(client_fd);
     exit(EXIT_SUCCESS);
@@ -126,8 +191,8 @@ int main(int argc, char *argv[]) {
     shared->sem = sem_create(IPC_PRIVATE, 1, IPC_CREAT | IPC_EXCL | 0600, 1);
 
     // Structure pour le thread de broadcast
-    BroadcastData broadcast_data = {
-        .broadcast_pipe = {broadcast_pipe[0], broadcast_pipe[1]},
+    BroadcastThreadData thread_data = {
+        .pipe_read = broadcast_pipe[0],
         .shared = shared
     };
 
@@ -138,7 +203,7 @@ int main(int argc, char *argv[]) {
     printf("Map chargée avec succès\n");
 
     pthread_t broadcast_thread;
-    pthread_create(&broadcast_thread, NULL, broadcast_handler, &broadcast_pipe[0]);
+    pthread_create(&broadcast_thread, NULL, broadcast_handler, &thread_data);
 
     // 3. BOUCLE PRINCIPALE
     while (!stop_requested) {
@@ -177,9 +242,11 @@ int main(int argc, char *argv[]) {
     sem_delete(shared->sem);
     sshmdt(shared);
     shmctl(shm_id, IPC_RMID, NULL);
-    sclose(broadcast_pipe[1]);  // Ferme l'écriture pour terminer le thread
+    // Avant de fermer les pipes, signaler au thread de s'arrêter
+    shutdown(broadcast_pipe[1], SHUT_WR);  // Ferme proprement l'écriture
     pthread_join(broadcast_thread, NULL);
     sclose(broadcast_pipe[0]);
+    sclose(broadcast_pipe[1]);
     
     return 0;
 }

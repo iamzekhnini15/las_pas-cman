@@ -55,66 +55,86 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
+       // After receiving GAME_START, add handling for MAP_DATA:
         if (msg.code == GAME_START) {
             printf("La partie commence !\n");
-            break;
+            printf("Player ID: %s\n", msg.messageText);
+            
+            // Now wait for MAP_DATA
+            if (sread(sockfd, &msg, sizeof(msg)) <= 0) {
+                perror("Erreur de lecture de la map");
+                sclose(sockfd);
+                exit(EXIT_FAILURE);
+            }
+            
+            if (msg.code == MAP_DATA) {
+                printf("[CLIENT] Map reçue:\n%s\n", msg.messageText);
+                nwrite(STDOUT_FILENO, &msg, sizeof(msg));
+            }
         }
+        
     }
 
     // 5. CONFIGURATION DES PIPES
     // Pipe pour les commandes clavier (pas-cman-ipl -> pas_client)
     int pipe_commands[2];  
-    // Pipe pour les données de jeu (pas_client -> pas-cman-ipl)
-    int pipe_game_data[2]; 
-
     spipe(pipe_commands);
-    spipe(pipe_game_data);
+
 
     // 6. LANCEMENT DE L'INTERFACE GRAPHIQUE
     pid_t ipl_pid = sfork();
     // Dans le fork de pas-cman-ipl :
     if (ipl_pid == 0) {
-        // 1. Redirige STDIN pour lire depuis le socket
-        sdup2(sockfd, STDIN_FILENO);
+        // Fermer les extrémités inutiles
+        sclose(pipe_commands[0]);
         
-        // 2. Redirige STDOUT pour envoyer les commandes clavier
-        sdup2(pipe_commands[1], STDOUT_FILENO);
+        // Rediriger les entrées/sorties
+        sdup2(sockfd, STDIN_FILENO);   // Lecture depuis le socket
+        sdup2(pipe_commands[1], STDOUT_FILENO); // Écriture vers le parent
         
-        // 3. Lance l'interface graphique
+        // Fermer les descripteurs inutiles
+        sclose(sockfd);
+        sclose(pipe_commands[1]);
+        
         sexecl(IPL_CMD, IPL_CMD, NULL);
+        exit(EXIT_FAILURE);
     }
-
+    
     // 7. BOUCLE DE COMMUNICATION
     struct pollfd fds[2] = {
         {sockfd, POLLIN, 0},          // Surveille le socket pour les données du serveur
         {pipe_commands[0], POLLIN, 0}  // Surveille le pipe pour les commandes clavier
     };
 
+    printf("[CLIENT] Configuration:\n");
+    printf("  - Socket: %d\n", sockfd);
+    printf("  - Pipe commandes: [%d,%d]\n", pipe_commands[0], pipe_commands[1]);
+
     while (1) {
-        int ret = poll(fds, 2, -1);
+
+        int ret = poll(fds, 2, -1); // Surveiller les 2 descripteurs
         if (ret == -1) {
             perror("poll");
             break;
         }
 
-        // Données reçues du serveur
+        // Données du serveur
         if (fds[0].revents & POLLIN) {
             char buffer[1024];
             ssize_t n = read(sockfd, buffer, sizeof(buffer));
             if (n <= 0) break;
             
-            // Transfère au pas-cman-ipl via pipe_game_data
-            nwrite(pipe_game_data[1], buffer, n);
+            // Debug
+            printf("Reçu %zd bytes du serveur\n", n);
         }
-
-        // Commandes clavier reçues de pas-cman-ipl
+    
+        // Commandes de l'interface
         if (fds[1].revents & POLLIN) {
-            char command[256];
-            ssize_t n = read(pipe_commands[0], command, sizeof(command));
+            char cmd[256];
+            ssize_t n = read(pipe_commands[0], cmd, sizeof(cmd));
             if (n <= 0) break;
             
-            // Transfère au serveur via le socket
-            nwrite(sockfd, command, n);
+            nwrite(sockfd, cmd, n);
         }
     }
 
@@ -123,7 +143,6 @@ int main(int argc, char *argv[]) {
     swaitpid(ipl_pid, NULL, 0);
     sclose(sockfd);
     sclose(pipe_commands[0]);
-    sclose(pipe_game_data[1]);
 
     return 0;
 }

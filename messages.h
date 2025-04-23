@@ -15,7 +15,8 @@ typedef enum
   GAME_START = 20,      // La partie peut commencer (2 joueurs connectés)
   GAME_CANCEL = 21,     // Pas assez de joueurs après le temps d'attente
   PLAYER_MOVE = 30,     // Un joueur a fait un mouvement (pour extension future)
-  GAME_END = 40         // Fin de partie (pour extension future)
+  GAME_END = 40,         // Fin de partie (pour extension future)
+  MAP_DATA = 50
 } Code;
 
 /* struct message used between server and client */
