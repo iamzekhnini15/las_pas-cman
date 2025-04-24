@@ -1,11 +1,8 @@
-#include <stdio.h>
+#include <stdio.h> 
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/wait.h>
 #include <poll.h>
-#include <fcntl.h>
 
 #include "utils_v3.h"
 #include "messages.h"
@@ -19,10 +16,10 @@ int initSocketClient(char * serverIP, int serverPort) {
 }
 
 int main(int argc, char *argv[]) {
-    // 1. CONNEXION AU SERVEUR
+    // 1. Connexion au serveur
     int sockfd = initSocketClient(SERVER_IP, SERVER_PORT);
 
-    // 2. INSCRIPTION
+    // 2. Inscription
     char pseudo[MAX_PSEUDO];
     printf("Entrez votre pseudo : ");
     fgets(pseudo, sizeof(pseudo), stdin);
@@ -33,116 +30,94 @@ int main(int argc, char *argv[]) {
     msg.code = INSCRIPTION_REQUEST;
     nwrite(sockfd, &msg, sizeof(msg));
 
-    // 3. ATTENTE DE LA REPONSE DU SERVEUR
+    // 3. Attente de la réponse
     if (sread(sockfd, &msg, sizeof(msg)) <= 0) {
-        perror("Erreur de lecture du serveur");
+        perror("Erreur lecture serveur");
         sclose(sockfd);
         exit(EXIT_FAILURE);
     }
 
     if (msg.code == INSCRIPTION_KO) {
-        printf("Le serveur est plein. Connexion refusée.\n");
+        printf("Connexion refusée : serveur plein.\n");
         sclose(sockfd);
         exit(EXIT_FAILURE);
     }
 
-    // 4. ATTENTE DU DEBUT DE LA PARTIE
-    printf("En attente d'un deuxième joueur...\n");
+    // 4. Attente de GAME_START
+    printf("En attente d’un deuxième joueur...\n");
+
     while (1) {
         if (sread(sockfd, &msg, sizeof(msg)) <= 0) {
-            perror("Erreur de lecture du serveur");
+            perror("Erreur lecture serveur");
             sclose(sockfd);
             exit(EXIT_FAILURE);
         }
 
-       // After receiving GAME_START, add handling for MAP_DATA:
         if (msg.code == GAME_START) {
             printf("La partie commence !\n");
-            printf("Player ID: %s\n", msg.messageText);
-            
-            // Now wait for MAP_DATA
-            if (sread(sockfd, &msg, sizeof(msg)) <= 0) {
-                perror("Erreur de lecture de la map");
+
+            // 5. Lecture de la MAP
+            if (sread(sockfd, &msg, sizeof(msg)) <= 0 || msg.code != MAP_DATA) {
+                perror("Erreur lecture MAP");
                 sclose(sockfd);
                 exit(EXIT_FAILURE);
             }
-            
-            if (msg.code == MAP_DATA) {
-                printf("[CLIENT] Map reçue:\n%s\n", msg.messageText);
-                nwrite(STDOUT_FILENO, &msg, sizeof(msg));
+
+            // 6. Création d’un pipe
+            int pipe_commands[2];
+            spipe(pipe_commands);
+
+            // 7. Fork pour interface graphique
+            pid_t ipl_pid = sfork();
+            if (ipl_pid == 0) {
+                // Fils : Interface
+                sclose(pipe_commands[1]);                  // Ferme écriture
+                sdup2(pipe_commands[0], STDIN_FILENO);     // Lit depuis le pipe
+                sclose(pipe_commands[0]);                  // Ferme original
+                sexecl(IPL_CMD, IPL_CMD, NULL);
+                exit(EXIT_FAILURE);
             }
-        }
-        
-    }
 
-    // 5. CONFIGURATION DES PIPES
-    // Pipe pour les commandes clavier (pas-cman-ipl -> pas_client)
-    int pipe_commands[2];  
-    spipe(pipe_commands);
+            // Père : Écrit la MAP
+            sclose(pipe_commands[0]); // Ferme lecture
+            nwrite(pipe_commands[1], msg.messageText, strlen(msg.messageText));
 
+            // 8. Boucle communication (socket <-> interface graphique)
+            struct pollfd fds[2] = {
+                {sockfd, POLLIN, 0},
+                {pipe_commands[1], POLLIN, 0}
+            };
 
-    // 6. LANCEMENT DE L'INTERFACE GRAPHIQUE
-    pid_t ipl_pid = sfork();
-    // Dans le fork de pas-cman-ipl :
-    if (ipl_pid == 0) {
-        // Fermer les extrémités inutiles
-        sclose(pipe_commands[0]);
-        
-        // Rediriger les entrées/sorties
-        sdup2(sockfd, STDIN_FILENO);   // Lecture depuis le socket
-        sdup2(pipe_commands[1], STDOUT_FILENO); // Écriture vers le parent
-        
-        // Fermer les descripteurs inutiles
-        sclose(sockfd);
-        sclose(pipe_commands[1]);
-        
-        sexecl(IPL_CMD, IPL_CMD, NULL);
-        exit(EXIT_FAILURE);
-    }
-    
-    // 7. BOUCLE DE COMMUNICATION
-    struct pollfd fds[2] = {
-        {sockfd, POLLIN, 0},          // Surveille le socket pour les données du serveur
-        {pipe_commands[0], POLLIN, 0}  // Surveille le pipe pour les commandes clavier
-    };
+            while (1) {
+                int res = poll(fds, 2, -1);
+                if (res == -1) {
+                    perror("poll");
+                    break;
+                }
 
-    printf("[CLIENT] Configuration:\n");
-    printf("  - Socket: %d\n", sockfd);
-    printf("  - Pipe commandes: [%d,%d]\n", pipe_commands[0], pipe_commands[1]);
+                if (fds[0].revents & POLLIN) {
+                    char buffer[1024];
+                    ssize_t n = sread(sockfd, buffer, sizeof(buffer));
+                    if (n <= 0) break;
+                    // Traitement éventuel ici
+                }
 
-    while (1) {
+                if (fds[1].revents & POLLIN) {
+                    char cmd[256];
+                    ssize_t n = sread(pipe_commands[1], cmd, sizeof(cmd));
+                    if (n <= 0) break;
+                    nwrite(sockfd, cmd, n);
+                }
+            }
 
-        int ret = poll(fds, 2, -1); // Surveiller les 2 descripteurs
-        if (ret == -1) {
-            perror("poll");
+            // 9. Nettoyage
+            skill(ipl_pid, SIGTERM);
+            swaitpid(ipl_pid, NULL, 0);
+            sclose(pipe_commands[1]);
             break;
         }
-
-        // Données du serveur
-        if (fds[0].revents & POLLIN) {
-            char buffer[1024];
-            ssize_t n = read(sockfd, buffer, sizeof(buffer));
-            if (n <= 0) break;
-            
-            // Debug
-            printf("Reçu %zd bytes du serveur\n", n);
-        }
-    
-        // Commandes de l'interface
-        if (fds[1].revents & POLLIN) {
-            char cmd[256];
-            ssize_t n = read(pipe_commands[0], cmd, sizeof(cmd));
-            if (n <= 0) break;
-            
-            nwrite(sockfd, cmd, n);
-        }
     }
 
-    // 8. NETTOYAGE
-    skill(ipl_pid, SIGTERM);
-    swaitpid(ipl_pid, NULL, 0);
     sclose(sockfd);
-    sclose(pipe_commands[0]);
-
     return 0;
 }
